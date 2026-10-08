@@ -9,8 +9,10 @@ A small Python utility that captures a prompt with global hotkeys, sends it to t
 - Global prompt capture using macOS Quartz keyboard events
 - OpenAI Responses API integration
 - **Fast mode enabled by default** using `service_tier="fast"`
-- Low reasoning effort by default to favor response speed
+- GPT-6.1 Sol by default, with low reasoning effort to favor response speed
 - Human-like typing delays and occasional corrections
+- Physical keystrokes made during generated typing are queued and replayed afterward, so they do not interleave with the response
+- Escape cancels prompt capture, an in-flight response stream, or generated typing
 - Live typing-speed controls
 - Clipboard commands
 
@@ -57,7 +59,7 @@ Optional environment variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPENAI_MODEL` | `gpt-5.6` | Model used for responses |
+| `OPENAI_MODEL` | `gpt-6.1-sol` | Model used for responses |
 | `OPENAI_SERVICE_TIER` | `fast` | API processing tier; set to `default` to use standard processing |
 | `OPENAI_REASONING_EFFORT` | `low` | Reasoning effort; support depends on the selected model |
 | `TYPOER_WPM` | `180` | Initial typing speed |
@@ -65,6 +67,8 @@ Optional environment variables:
 | `OPENAI_SYSTEM_PROMPT` | built-in prompt | Override the default response instructions |
 
 Fast mode provides lower-latency processing on supported models, but it is billed at a premium relative to standard processing. Availability depends on the selected model and API account. See the [Fast mode documentation](https://developers.openai.com/api/docs/guides/fast-mode) for current details.
+
+During generated typing, Typoer temporarily queues physical key presses and replays them after the response finishes (or is cancelled). This prevents your text from interleaving with Typoer's output; queued input is delivered to whichever app is focused when replay occurs.
 
 ## Run
 
@@ -82,7 +86,7 @@ On first launch, macOS may block global keyboard monitoring or simulated pasting
 | --- | --- |
 | Control + Option + U | Start capturing a prompt |
 | Control + Option + I | Send the captured prompt |
-| Escape | Stop the current generated typing |
+| Escape | Cancel prompt capture, cancel an API request, or stop generated typing |
 | Control + Option + ↑ | Increase typing speed by 10 WPM |
 | Control + Option + ↓ | Decrease typing speed by 10 WPM (minimum 10 WPM) |
 | Control + Option + 0 | Log current typing speed in Terminal |
@@ -100,6 +104,7 @@ On first launch, macOS may block global keyboard monitoring or simulated pasting
 - **Pasting fails:** Enable Accessibility for Terminal (or the launcher) in System Settings → Privacy & Security → Accessibility.
 - **API key error:** Confirm `OPENAI_API_KEY` is set in the same Terminal session.
 - **Unsupported model or service tier:** Set `OPENAI_MODEL` to a model available to your API project, or set `OPENAI_SERVICE_TIER=default` if Fast mode is unavailable.
+- **Escape did not cancel a request:** Ensure Typoer has Input Monitoring permission; cancellation closes the active streaming response.
 
 ## Security
 
