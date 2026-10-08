@@ -7,7 +7,7 @@ Set OPENAI_API_KEY in your environment before running.
 Hotkeys:
   Ctrl+Option+U      Start capturing a prompt
   Ctrl+Option+I      Send the prompt
-  Escape             Stop generated typing
+  Escape             Cancel prompt/API request or stop generated typing
   Ctrl+Option+Up     Increase typing speed by 10 WPM
   Ctrl+Option+Down   Decrease typing speed by 10 WPM (minimum 10)
   Ctrl+Option+0      Log the current typing speed in Terminal
@@ -74,7 +74,7 @@ class Settings:
     kill_prompt: str = "/kill"
     clipboard_prompt: str = "/clip"
     clipboard_type_prompt: str = "/clipboard"
-    model: str = "gpt-5.6"
+    model: str = "gpt-6.1-sol"
     reasoning_effort: str | None = "low"
     service_tier: str = "fast"
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -131,11 +131,14 @@ def keycode_for_char(char: str) -> tuple[int, bool] | None:
     return (keycode, needs_shift)
 
 
+_SYNTHETIC_EVENT_TAG = 0x5459504F4552  # "TYPOER"
+
 def post_key(keycode: int, down: bool, shift: bool = False) -> None:
     event = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
     if event is None:
         raise RuntimeError("Could not create keyboard event")
     Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskShift if shift else 0)
+    Quartz.CGEventSetIntegerValueField(event, Quartz.kCGEventSourceUserData, _SYNTHETIC_EVENT_TAG)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 
@@ -179,7 +182,7 @@ class HumanTyper:
             raise ValueError("Typing speed must be greater than zero.")
         self._settings = replace(self._settings, typing_wpm=wpm)
 
-    def type(self, text: str) -> bool:
+    def type(self, text: str, cancel_event: threading.Event | None = None) -> bool:
         seconds_per_character = 12 / self._settings.typing_wpm
         minimum_delay = seconds_per_character * 0.2
         maximum_delay = seconds_per_character * 1.8
@@ -187,7 +190,7 @@ class HumanTyper:
         mistakes = 0
 
         while position < len(text):
-            if self._stop_requested():
+            if (cancel_event is not None and cancel_event.is_set()) or self._stop_requested():
                 return False
             if mistakes and self._should_correct(position, mistakes, len(text)):
                 for _ in range(mistakes):
@@ -256,8 +259,22 @@ class ResponseService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: OpenAI | None = None
+        self._stream_lock = threading.Lock()
+        self._active_stream = None
 
-    def generate(self, prompt: str) -> str:
+    def cancel(self) -> None:
+        """Close an in-flight response stream so Escape can abort the API request."""
+        with self._stream_lock:
+            stream = self._active_stream
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                LOGGER.debug("Response stream was already closed.", exc_info=True)
+
+    def generate(self, prompt: str, cancel_event: threading.Event) -> str | None:
+        if cancel_event.is_set():
+            return None
         if self._client is None:
             if not os.getenv("OPENAI_API_KEY"):
                 raise RuntimeError("OPENAI_API_KEY is not set")
@@ -268,19 +285,46 @@ class ResponseService:
             "instructions": self._settings.system_prompt,
             "input": prompt,
             "service_tier": self._settings.service_tier,
+            "stream": True,
         }
         if self._settings.reasoning_effort:
             request["reasoning"] = {"effort": self._settings.reasoning_effort}
-        response = self._client.responses.create(**request)
-        if not response.output_text:
-            raise RuntimeError("The OpenAI response did not contain text")
-        return response.output_text
+
+        stream = self._client.responses.create(**request)
+        with self._stream_lock:
+            self._active_stream = stream
+        pieces: list[str] = []
+        try:
+            for event in stream:
+                if cancel_event.is_set():
+                    return None
+                if event.type == "response.output_text.delta":
+                    pieces.append(event.delta)
+                elif event.type == "response.failed":
+                    raise RuntimeError("The OpenAI response failed")
+                elif event.type == "error":
+                    raise RuntimeError(f"OpenAI streaming error: {event}")
+            if cancel_event.is_set():
+                return None
+            text = "".join(pieces)
+            if not text:
+                raise RuntimeError("The OpenAI response did not contain text")
+            return text
+        finally:
+            with self._stream_lock:
+                if self._active_stream is stream:
+                    self._active_stream = None
+            try:
+                stream.close()
+            except Exception:
+                pass
 
 
 class State(Enum):
     IDLE = auto()
     RECORDING = auto()
     WAITING = auto()
+    TYPING = auto()
     STOPPED = auto()
 
 
@@ -292,6 +336,9 @@ class App:
         self.state = State.IDLE
         self.lock = threading.RLock()
         self.prompt: list[str] = []
+        self.job_id = 0
+        self.cancel_event: threading.Event | None = None
+        self.deferred_keys: dict[int, list[tuple[int, int]]] = {}
         self.event_tap = None
         self.run_loop = None
 
@@ -317,7 +364,8 @@ class App:
         print("Typoer ready.")
         print("Ctrl+Option+U = start prompt")
         print("Ctrl+Option+I = send prompt")
-        print("Escape = stop typing")
+        print("Escape = cancel prompt/request or stop generated typing")
+        print(f"API model: {self.settings.model}")
         print("Ctrl+Option+Up/Down = change speed by 10 WPM")
         print("Ctrl+Option+0 = show current speed")
         print("API service tier: fast")
@@ -335,10 +383,38 @@ class App:
         if event_type != Quartz.kCGEventKeyDown:
             return event
 
+        # Let Typoer's own simulated keystrokes through without queueing them.
+        try:
+            if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData) == _SYNTHETIC_EVENT_TAG:
+                return event
+        except Exception:
+            pass
+
         keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
         flags = Quartz.CGEventGetFlags(event)
         ctrl = bool(flags & Quartz.kCGEventFlagMaskControl)
         alt = bool(flags & Quartz.kCGEventFlagMaskAlternate)
+
+        # Escape cancels prompt capture, an in-flight API request, or output typing.
+        if keycode == KEYCODES["escape"]:
+            with self.lock:
+                if self.state is State.RECORDING:
+                    self.prompt.clear()
+                    self.state = State.IDLE
+                    LOGGER.info("Prompt capture cancelled.")
+                    return None
+                if self.state in (State.WAITING, State.TYPING):
+                    if self.cancel_event is not None:
+                        self.cancel_event.set()
+                    self.state = State.IDLE
+                    LOGGER.info("Request/output cancelled.")
+                    should_cancel_request = True
+                else:
+                    should_cancel_request = False
+            if should_cancel_request:
+                self.service.cancel()
+                return None
+            return event
 
         if ctrl and alt and keycode == KEYCODES["u"]:
             self.start()
@@ -360,6 +436,11 @@ class App:
             if self.state is State.RECORDING:
                 self._capture_key(keycode, flags)
                 return None
+            if self.state is State.TYPING:
+                # Keep physical typing from interleaving with generated output.
+                # Replay it after this job finishes or is cancelled.
+                self.deferred_keys.setdefault(self.job_id, []).append((keycode, flags))
+                return None
         return event
 
     def start(self) -> None:
@@ -378,6 +459,11 @@ class App:
                 return
             prompt = "".join(self.prompt)
             self.state = State.WAITING
+            self.job_id += 1
+            job_id = self.job_id
+            cancel_event = threading.Event()
+            self.cancel_event = cancel_event
+            self.deferred_keys[job_id] = []
 
         if prompt.strip() == self.settings.kill_prompt:
             self.stop()
@@ -386,24 +472,62 @@ class App:
         if prompt.strip() == self.settings.clipboard_prompt:
             prompt = self._read_clipboard()
             if not prompt:
-                self._set_idle()
+                self._set_idle(job_id)
                 return
-        threading.Thread(target=self._process, args=(prompt, clipboard_mode), daemon=True).start()
+        threading.Thread(
+            target=self._process,
+            args=(prompt, clipboard_mode, job_id, cancel_event),
+            daemon=True,
+        ).start()
 
-    def _process(self, prompt: str, clipboard_mode: bool) -> None:
+    def _process(
+        self, prompt: str, clipboard_mode: bool, job_id: int,
+        cancel_event: threading.Event,
+    ) -> None:
         try:
+            if cancel_event.is_set():
+                return
             if clipboard_mode:
                 text = self._read_clipboard()
             else:
                 type_text(self.settings.waiting_text)
-                text = " " + self.service.generate(prompt)
-            completed = self.typer.type(text)
+                if cancel_event.is_set():
+                    return
+                response = self.service.generate(prompt, cancel_event)
+                if response is None or cancel_event.is_set():
+                    return
+                text = " " + response
+
+            if cancel_event.is_set():
+                return
+            with self.lock:
+                if self.job_id != job_id or self.state is State.STOPPED:
+                    return
+                self.state = State.TYPING
+            completed = self.typer.type(text, cancel_event)
             LOGGER.info("Typing %s.", "completed" if completed else "stopped")
         except Exception:
-            LOGGER.exception("Could not process command.")
-            type_text(",,")
+            if not cancel_event.is_set():
+                LOGGER.exception("Could not process command.")
+                type_text(",,")
         finally:
-            self._set_idle()
+            self._replay_deferred_keys(job_id)
+            self._set_idle(job_id)
+
+    def _replay_deferred_keys(self, job_id: int) -> None:
+        with self.lock:
+            queued = self.deferred_keys.pop(job_id, [])
+        for keycode, flags in queued:
+            down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+            up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+            if down is None or up is None:
+                continue
+            Quartz.CGEventSetFlags(down, flags)
+            Quartz.CGEventSetFlags(up, flags)
+            Quartz.CGEventSetIntegerValueField(down, Quartz.kCGEventSourceUserData, _SYNTHETIC_EVENT_TAG)
+            Quartz.CGEventSetIntegerValueField(up, Quartz.kCGEventSourceUserData, _SYNTHETIC_EVENT_TAG)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
     def _capture_key(self, keycode: int, flags: int) -> None:
         if keycode == KEYCODES["backspace"]:
@@ -432,9 +556,13 @@ class App:
     def _read_clipboard() -> str:
         return _clipboard_read()
 
-    def _set_idle(self) -> None:
+    def _set_idle(self, job_id: int | None = None) -> None:
         with self.lock:
-            if self.state is not State.STOPPED:
+            if self.state is State.STOPPED:
+                return
+            if job_id is not None and job_id != self.job_id:
+                return
+            if self.state is not State.RECORDING:
                 self.state = State.IDLE
 
     def stop(self) -> None:
