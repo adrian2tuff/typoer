@@ -293,6 +293,14 @@ class ResponseService:
         stream = self._client.responses.create(**request)
         with self._stream_lock:
             self._active_stream = stream
+        if cancel_event.is_set():
+            try:
+                stream.close()
+            finally:
+                with self._stream_lock:
+                    if self._active_stream is stream:
+                        self._active_stream = None
+            return None
         pieces: list[str] = []
         try:
             for event in stream:
@@ -501,7 +509,12 @@ class App:
             if cancel_event.is_set():
                 return
             with self.lock:
-                if self.job_id != job_id or self.state is State.STOPPED:
+                if (
+                    self.job_id != job_id
+                    or self.state is not State.WAITING
+                    or self.state is State.STOPPED
+                    or cancel_event.is_set()
+                ):
                     return
                 self.state = State.TYPING
             completed = self.typer.type(text, cancel_event)
