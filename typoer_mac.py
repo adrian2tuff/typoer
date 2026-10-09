@@ -5,6 +5,7 @@ Install dependencies with: python3 -m pip install -r requirements.txt
 Set OPENAI_API_KEY in your environment before running.
 
 Hotkeys:
+  Ctrl+Option+S      Capture a screen region for the next API prompt
   Ctrl+Option+U      Start capturing a prompt
   Ctrl+Option+I      Send the prompt
   Escape             Cancel prompt/API request or stop generated typing
@@ -20,12 +21,14 @@ Special prompts:
 
 from __future__ import annotations
 
+import base64
 import logging
 import math
 import os
 import random
 import string
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -272,7 +275,10 @@ class ResponseService:
             except Exception:
                 LOGGER.debug("Response stream was already closed.", exc_info=True)
 
-    def generate(self, prompt: str, cancel_event: threading.Event) -> str | None:
+    def generate(
+        self, prompt: str, cancel_event: threading.Event,
+        screenshot: bytes | None = None,
+    ) -> str | None:
         if cancel_event.is_set():
             return None
         if self._client is None:
@@ -280,10 +286,26 @@ class ResponseService:
                 raise RuntimeError("OPENAI_API_KEY is not set")
             self._client = OpenAI(timeout=self._settings.openai_timeout)
 
+        if screenshot is None:
+            api_input: Any = prompt
+        else:
+            image_data = base64.b64encode(screenshot).decode("ascii")
+            api_input = [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_data}",
+                        "detail": "high",
+                    },
+                ],
+            }]
+
         request: dict[str, Any] = {
             "model": self._settings.model,
             "instructions": self._settings.system_prompt,
-            "input": prompt,
+            "input": api_input,
             "service_tier": self._settings.service_tier,
             "stream": True,
         }
@@ -347,6 +369,8 @@ class App:
         self.job_id = 0
         self.cancel_event: threading.Event | None = None
         self.deferred_keys: dict[int, list[tuple[int, int]]] = {}
+        self.pending_screenshot: bytes | None = None
+        self.screenshot_capture_active = False
         self.event_tap = None
         self.run_loop = None
 
@@ -370,6 +394,7 @@ class App:
         Quartz.CGEventTapEnable(self.event_tap, True)
 
         print("Typoer ready.")
+        print("Ctrl+Option+S = select a screenshot region for the next API prompt")
         print("Ctrl+Option+U = start prompt")
         print("Ctrl+Option+I = send prompt")
         print("Escape = cancel prompt/request or stop generated typing")
@@ -424,6 +449,9 @@ class App:
                 return None
             return event
 
+        if ctrl and alt and keycode == CHAR_KEYCODES["s"]:
+            self._start_screenshot_capture()
+            return None
         if ctrl and alt and keycode == KEYCODES["u"]:
             self.start()
             return None
@@ -451,8 +479,52 @@ class App:
                 return None
         return event
 
+    def _start_screenshot_capture(self) -> None:
+        with self.lock:
+            if self.screenshot_capture_active:
+                LOGGER.info("A screenshot selection is already in progress.")
+                return
+            self.screenshot_capture_active = True
+        LOGGER.info("Select a screen region. Press Escape to cancel the selection.")
+        threading.Thread(target=self._capture_screenshot, daemon=True).start()
+
+    def _capture_screenshot(self) -> None:
+        path = None
+        try:
+            fd, path = tempfile.mkstemp(prefix="typoer-screenshot-", suffix=".png")
+            os.close(fd)
+            result = subprocess.run(
+                ["/usr/sbin/screencapture", "-i", "-x", path],
+                capture_output=True, text=True, check=False,
+            )
+            if result.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) == 0:
+                LOGGER.info("Screenshot selection cancelled or unavailable.")
+                return
+            with open(path, "rb") as image_file:
+                image_bytes = image_file.read()
+            with self.lock:
+                self.pending_screenshot = image_bytes
+            LOGGER.info(
+                "Screenshot attached to the next API prompt (%d KB). "
+                "Start a prompt with Ctrl+Option+U, then send with Ctrl+Option+I.",
+                max(1, len(image_bytes) // 1024),
+            )
+        except Exception:
+            LOGGER.exception("Could not capture screenshot.")
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            with self.lock:
+                self.screenshot_capture_active = False
+
     def start(self) -> None:
         with self.lock:
+            if self.screenshot_capture_active:
+                LOGGER.info("Finish or cancel screenshot selection before starting a prompt.")
+                return
             if self.state is not State.IDLE:
                 return
             self.prompt.clear()
@@ -482,15 +554,20 @@ class App:
             if not prompt:
                 self._set_idle(job_id)
                 return
+        with self.lock:
+            screenshot = None
+            if not clipboard_mode and prompt.strip() != self.settings.kill_prompt:
+                screenshot = self.pending_screenshot
+                self.pending_screenshot = None
         threading.Thread(
             target=self._process,
-            args=(prompt, clipboard_mode, job_id, cancel_event),
+            args=(prompt, clipboard_mode, job_id, cancel_event, screenshot),
             daemon=True,
         ).start()
 
     def _process(
         self, prompt: str, clipboard_mode: bool, job_id: int,
-        cancel_event: threading.Event,
+        cancel_event: threading.Event, screenshot: bytes | None = None,
     ) -> None:
         try:
             if cancel_event.is_set():
@@ -501,7 +578,7 @@ class App:
                 type_text(self.settings.waiting_text)
                 if cancel_event.is_set():
                     return
-                response = self.service.generate(prompt, cancel_event)
+                response = self.service.generate(prompt, cancel_event, screenshot)
                 if response is None or cancel_event.is_set():
                     return
                 text = " " + response
