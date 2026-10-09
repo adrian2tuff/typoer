@@ -14,6 +14,7 @@ A small Python utility that captures a prompt with global hotkeys, sends it to t
 - Physical keystrokes made during generated typing are queued and replayed afterward, so they do not interleave with the response
 - Escape cancels prompt capture, an in-flight response stream, or generated typing
 - Live typing-speed controls
+- Region screenshots attached to the next API prompt for visual questions
 - Clipboard commands
 
 ## Requirements
@@ -84,6 +85,7 @@ On first launch, macOS may block global keyboard monitoring or simulated pasting
 
 | Shortcut | Action |
 | --- | --- |
+| Control + Option + S | Select a screen region and attach it to the next API prompt |
 | Control + Option + U | Start capturing a prompt |
 | Control + Option + I | Send the captured prompt |
 | Escape | Cancel prompt capture, cancel an API request, or stop generated typing |
@@ -91,6 +93,15 @@ On first launch, macOS may block global keyboard monitoring or simulated pasting
 | Control + Option + ↓ | Decrease typing speed by 10 WPM (minimum 10 WPM) |
 | Control + Option + 0 | Log current typing speed in Terminal |
 | Control + C in Terminal | Quit Typoer |
+
+### Screenshots
+
+1. Press **Control + Option + S**.
+2. Drag to select a screen region; press Escape to cancel the selection.
+3. After Typoer reports that the screenshot is attached, press **Control + Option + U**, type your question, and press **Control + Option + I**.
+4. The screenshot is included with that prompt, then discarded from Typoer's pending state. If you do not send a prompt, the screenshot stays pending until the next API prompt or until Typoer exits.
+
+Typoer captures only the region you select, keeps the image in memory while pending, and removes its temporary PNG file after capture. The image is sent to the OpenAI API with your prompt, so check the selected region for passwords, private messages, or other sensitive information before sending. macOS may ask for Screen Recording permission the first time.
 
 ### Special prompts
 
