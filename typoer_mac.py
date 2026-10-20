@@ -479,7 +479,12 @@ class App:
                     self._capture_key(keycode, flags)
                 return None
             if self.state is State.TYPING:
-                # Keep physical typing from interleaving with generated output.
+                # type_text() uses an AppleScript Command+V to paste generated
+                # text. Do not defer/replay that shortcut, or it will paste the
+                # restored clipboard again after the response finishes.
+                if cmd and keycode == CHAR_KEYCODES["v"]:
+                    return event
+                # Keep other physical typing from interleaving with generated output.
                 # Replay it after this job finishes or is cancelled.
                 self.deferred_keys.setdefault(self.job_id, []).append((keycode, flags))
                 return None
