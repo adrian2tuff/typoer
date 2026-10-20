@@ -427,6 +427,7 @@ class App:
         flags = Quartz.CGEventGetFlags(event)
         ctrl = bool(flags & Quartz.kCGEventFlagMaskControl)
         alt = bool(flags & Quartz.kCGEventFlagMaskAlternate)
+        cmd = bool(flags & Quartz.kCGEventFlagMaskCommand)
 
         # Escape cancels prompt capture, an in-flight API request, or output typing.
         if keycode == KEYCODES["escape"]:
@@ -470,7 +471,12 @@ class App:
 
         with self.lock:
             if self.state is State.RECORDING:
-                self._capture_key(keycode, flags)
+                if cmd and keycode == CHAR_KEYCODES["v"]:
+                    # Handle Command+V ourselves so the paste goes into the prompt,
+                    # not into whichever app is focused after Typoer finishes.
+                    self.prompt.append(self._read_clipboard())
+                else:
+                    self._capture_key(keycode, flags)
                 return None
             if self.state is State.TYPING:
                 # Keep physical typing from interleaving with generated output.
