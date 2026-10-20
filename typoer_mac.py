@@ -7,6 +7,7 @@ Set OPENAI_API_KEY in your environment before running.
 Hotkeys:
   Ctrl+Option+S      Capture a screen region for the next API prompt
   Ctrl+Option+U      Start capturing a prompt
+  Ctrl+Option+V      Insert clipboard contents into the captured prompt
   Ctrl+Option+I      Send the prompt
   Escape             Cancel prompt/API request or stop generated typing
   Ctrl+Option+Up     Increase typing speed by 10 WPM
@@ -449,6 +450,12 @@ class App:
                 self.service.cancel()
                 return None
             return event
+
+        if ctrl and alt and keycode == CHAR_KEYCODES["v"]:
+            with self.lock:
+                if self.state is State.RECORDING:
+                    self.prompt.append(self._read_clipboard())
+            return None
 
         if ctrl and alt and keycode == CHAR_KEYCODES["s"]:
             self._start_screenshot_capture()
