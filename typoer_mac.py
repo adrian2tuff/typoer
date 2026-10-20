@@ -471,11 +471,10 @@ class App:
 
         with self.lock:
             if self.state is State.RECORDING:
-                if cmd and keycode == CHAR_KEYCODES["v"]:
-                    # Handle Command+V ourselves so the paste goes into the prompt,
-                    # not into whichever app is focused after Typoer finishes.
-                    self.prompt.append(self._read_clipboard())
-                else:
+                # Do not treat macOS Command shortcuts as prompt text or read the
+                # clipboard implicitly. Use the explicit /clip command when the
+                # clipboard should become the API prompt.
+                if not cmd:
                     self._capture_key(keycode, flags)
                 return None
             if self.state is State.TYPING:
